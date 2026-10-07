@@ -59,6 +59,12 @@ CREATE TABLE IF NOT EXISTS outbox (
 );
 
 CREATE INDEX IF NOT EXISTS outbox_by_target ON outbox (target, id);
+
+-- Служебные значения, например «после перезапуска сообщить владельцу об обновлении».
+CREATE TABLE IF NOT EXISTS kv (
+    key    TEXT PRIMARY KEY,
+    value  TEXT NOT NULL
+);
 """
 
 DIRECTIONS = ("both", "tg2vk", "vk2tg")
@@ -303,3 +309,18 @@ class Storage:
     async def outbox_done(self, job_id: int) -> None:
         await self._db.execute("DELETE FROM outbox WHERE id = ?", (job_id,))
         await self._db.commit()
+
+    # --- служебные значения ---
+
+    async def kv_set(self, key: str, value: str) -> None:
+        await self._db.execute("INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)", (key, value))
+        await self._db.commit()
+
+    async def kv_pop(self, key: str) -> str | None:
+        async with self._db.execute("SELECT value FROM kv WHERE key = ?", (key,)) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            return None
+        await self._db.execute("DELETE FROM kv WHERE key = ?", (key,))
+        await self._db.commit()
+        return row["value"]

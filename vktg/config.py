@@ -17,6 +17,7 @@ class Config:
     tg_token: str
     vk_token: str
     tg_proxy: str | None = None  # прокси только для Telegram, например http://127.0.0.1:12334
+    tg_owner_id: int | None = None  # Telegram ID владельца: ему доступно обновление бота (/update)
     vk_group_id: int | None = None
     vk_auto_setup: bool = True
     vk_api_version: str = "5.199"
@@ -74,6 +75,7 @@ def load_config() -> Config:
         tg_token=tg_token,
         vk_token=vk_token,
         tg_proxy=tg_proxy,
+        tg_owner_id=_int("TG_OWNER_ID", None),
         vk_group_id=abs(group_id) if group_id else None,
         vk_auto_setup=_bool("VK_AUTO_SETUP", True),
         db_path=os.getenv("DB_PATH", "bridge.db").strip() or "bridge.db",

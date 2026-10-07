@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
 import sys
 from functools import partial
 
@@ -11,16 +13,17 @@ import aiohttp
 from aiogram import Bot, Dispatcher
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.exceptions import TelegramNetworkError, TelegramUnauthorizedError
-from aiogram.types import BotCommand, BotCommandScopeAllGroupChats
+from aiogram.types import BotCommand, BotCommandScopeAllGroupChats, BotCommandScopeChat
 
 from .app import App, VKNames, fetch_url
 from .config import Config, ConfigError, load_config
 from .db import Storage
 from .linking import KEY_TTL
 from .queues import Outbox
-from .tg_handlers import build_router
+from .tg_handlers import UPDATE_NOTICE_KEY, build_router
 from .to_tg import ToTG
 from .to_vk import ToVK
+from .updater import Updater, UpdateError
 from .vk_api import VKApi, VKError
 from .vk_handlers import FatalVKError, VKHandlers
 
@@ -30,6 +33,10 @@ GROUP_COMMANDS = [
     BotCommand(command="bridge", description="Получить ключ или связать чат"),
     BotCommand(command="unbridge", description="Отключить мост"),
     BotCommand(command="status", description="Состояние моста"),
+    BotCommand(command="help", description="Инструкция"),
+]
+OWNER_COMMANDS = [
+    BotCommand(command="update", description="Обновить бота из GitHub"),
     BotCommand(command="help", description="Инструкция"),
 ]
 
@@ -65,7 +72,20 @@ async def cleanup_loop(app: App) -> None:
         await asyncio.sleep(3600)
 
 
-async def run(cfg: Config) -> None:
+async def announce_version(app: App, updater: Updater) -> None:
+    """Пишет версию в лог; если бот перезапустился после /update — сообщает владельцу."""
+    try:
+        version = await updater.version()
+    except UpdateError:
+        version = "неизвестна (не git-репозиторий)"
+    log.info("Версия: %s", version)
+    notice = await app.db.kv_pop(UPDATE_NOTICE_KEY)
+    if notice:
+        await app.notify("tg", json.loads(notice)["chat_id"], f"✅ Бот перезапущен.\nВерсия: {version}")
+
+
+async def run(cfg: Config) -> bool:
+    """Работает до остановки; возвращает True, если нужен перезапуск после обновления."""
     db = await Storage.open(cfg.db_path)
     http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120))
     bot = Bot(cfg.tg_token, session=AiohttpSession(proxy=cfg.tg_proxy) if cfg.tg_proxy else None)
@@ -96,8 +116,13 @@ async def run(cfg: Config) -> None:
         dp.include_router(build_router())
         try:
             await bot.set_my_commands(GROUP_COMMANDS, scope=BotCommandScopeAllGroupChats())
+            if cfg.tg_owner_id:
+                await bot.set_my_commands(OWNER_COMMANDS, scope=BotCommandScopeChat(chat_id=cfg.tg_owner_id))
         except Exception as exc:
             log.warning("Не удалось задать меню команд Telegram: %s", exc)
+
+        updater = Updater()
+        await announce_version(app, updater)
 
         to_tg, to_vk = ToTG(app), ToVK(app)  # регистрируют обработчики очереди — до outbox.start()
         pending = await outbox.start()
@@ -114,6 +139,12 @@ async def run(cfg: Config) -> None:
 
         vk_task.add_done_callback(on_vk_stopped)
 
+        async def stop_for_restart() -> None:
+            await app.restart.wait()
+            await dp.stop_polling()
+
+        background.append(asyncio.create_task(stop_for_restart(), name="restart-watch"))
+
         log.info("Мост запущен: Telegram @%s ↔ VK «%s» (id %s)", app.tg_username, app.group_name, group_id)
         # handle_as_tasks=False: апдейты Telegram разбираются по порядку, а медленная
         # загрузка файлов идёт в очередях доставки и не задерживает остальные чаты.
@@ -121,11 +152,13 @@ async def run(cfg: Config) -> None:
             bot,
             app=app,
             to_vk=to_vk,
+            updater=updater,
             handle_as_tasks=False,
             allowed_updates=dp.resolve_used_update_types(),
         )
         if vk_task.done() and not vk_task.cancelled() and isinstance(vk_task.exception(), FatalVKError):
             raise vk_task.exception()
+        return app.restart.is_set()
     finally:
         for task in background:
             task.cancel()
@@ -147,9 +180,9 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     try:
-        asyncio.run(run(cfg))
+        restart = asyncio.run(run(cfg))
     except KeyboardInterrupt:
-        pass
+        restart = False
     except (FatalVKError, VKError) as exc:
         log.critical("%s", exc)
         sys.exit(1)
@@ -169,6 +202,11 @@ def main() -> None:
     except aiohttp.ClientError as exc:
         log.critical("Не удаётся подключиться к VK: %s", exc)
         sys.exit(1)
+    if restart:
+        # Запускаем новый код в том же процессе: systemd видит тот же PID, база уже закрыта.
+        log.info("Перезапуск после обновления")
+        logging.shutdown()
+        os.execv(sys.executable, [sys.executable, "-m", "vktg"])
 
 
 if __name__ == "__main__":

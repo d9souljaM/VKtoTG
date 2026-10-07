@@ -28,7 +28,7 @@ class FakeBot:
         return SimpleNamespace(message_id=self._next_id)
 
     def __getattr__(self, name: str):
-        if not (name.startswith("send_") or name.startswith("edit_")):
+        if not name.startswith(("send_", "edit_", "answer_")):
             raise AttributeError(name)
 
         async def method(**kwargs):

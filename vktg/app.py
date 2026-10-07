@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -36,6 +36,7 @@ class App:
     outbox: Outbox
     names: VKNames
     fetch: Fetch
+    restart: asyncio.Event = field(default_factory=asyncio.Event)  # установлен — бот перезапустится
 
     async def notify(self, platform: str, chat_id: int, text: str) -> None:
         """Служебное сообщение в чат: platform = "tg" или "vk"."""

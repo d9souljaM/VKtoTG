@@ -22,7 +22,7 @@ fi
 
 echo "==> Устанавливаю Python"
 apt-get update -qq
-DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3 python3-venv curl >/dev/null
+DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3 python3-venv curl git >/dev/null
 if ! python3 -c 'import sys; sys.exit(sys.version_info < (3, 10))'; then
   echo "Нужен Python 3.10 или новее, а установлен $(python3 --version)."
   exit 1

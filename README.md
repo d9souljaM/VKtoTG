@@ -112,6 +112,33 @@ tar -xzf /root/vktg-update.tar.gz -C /opt/vktg && bash /opt/vktg/deploy/install.
 
 Сообщения, пришедшие во время перезапуска, не теряются: они ждут в очереди в `bridge.db`.
 
+### Обновление кнопкой в Telegram (из GitHub)
+
+Владелец бота может обновлять его прямо из Telegram: команда `/update` в личных сообщениях боту
+показывает новые коммиты из [репозитория](https://github.com/d9souljaM/VKtoTG) и кнопку
+«⬆️ Обновить и перезапустить». Бот делает `git pull`, при изменении `requirements.txt` ставит
+зависимости (если не получилось — возвращает прежнюю версию), перезапускается и присылает новую версию.
+
+Настройка, один раз:
+
+1. Подключите папку бота на сервере к GitHub (`.env`, `bridge.db` и `.venv` не трогаются):
+   ```bash
+   curl -fsSL https://raw.githubusercontent.com/d9souljaM/VKtoTG/main/deploy/setup-github.sh -o /tmp/setup-github.sh && bash /tmp/setup-github.sh
+   ```
+2. Напишите боту в личные сообщения `/start` — он покажет ваш Telegram ID.
+3. Впишите его в `.env` на сервере и перезапустите бота:
+   ```bash
+   echo "TG_OWNER_ID=ВАШ_ID" >> /opt/vktg/.env && systemctl restart vktg
+   ```
+
+Команда `/update` работает только у владельца; остальные пользователи её не видят.
+
+Если обновление сломало запуск, откатитесь на сервере к предыдущей версии:
+
+```bash
+cd /opt/vktg && runuser -u vktg -- git reset --hard HEAD@{1} && systemctl restart vktg
+```
+
 ## Подключение чатов (для пользователей)
 
 1. Добавьте Telegram-бота в группу.
@@ -170,6 +197,7 @@ tar -xzf /root/vktg-update.tar.gz -C /opt/vktg && bash /opt/vktg/deploy/install.
 | `TG_TOKEN` | — | Токен Telegram-бота (обязательно) |
 | `VK_TOKEN` | — | Ключ доступа сообщества VK (обязательно) |
 | `TG_PROXY` | — | Прокси только для Telegram: `http://…` или `socks5://…` |
+| `TG_OWNER_ID` | — | Telegram ID владельца: ему доступна команда `/update` |
 | `VK_GROUP_ID` | из токена | ID сообщества |
 | `VK_AUTO_SETUP` | `1` | Включать нужные настройки сообщества при запуске |
 | `DB_PATH` | `bridge.db` | Путь к базе SQLite |
@@ -198,4 +226,6 @@ python -m pytest
 | `vk_api.py` | Клиент VK API: методы, загрузка файлов, Long Poll |
 | `db.py` | SQLite: связки, ключи, пары сообщений |
 | `queues.py` | Очередь доставки в SQLite: порядок по чатам, повторы, переживает перезапуск |
+| `updater.py` | Обновление из GitHub по команде владельца `/update` |
 | `deploy/install.sh` | Установка и обновление на сервере (systemd) |
+| `deploy/setup-github.sh` | Подключение папки бота на сервере к GitHub для `/update` |
