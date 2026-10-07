@@ -7,7 +7,7 @@ from aiogram.types import Chat, Message, PhotoSize, Sticker, User
 from vktg import tg_handlers
 from vktg.queues import Outbox
 from vktg.to_tg import ToTG
-from vktg.to_vk import ToVK
+from vktg.to_vk import UPLOAD_CONCURRENCY, ToVK
 from vktg.vk_api import VKError
 from vktg.vk_handlers import VKHandlers
 
@@ -232,6 +232,24 @@ def test_tg_sticker_becomes_text(make_app):
         await tg_handlers.on_group_message(tg_msg(9, sticker=sticker), app, ToVK(app))
         await app.outbox.join()
         assert app.vk.sent[-1]["text"] == "[TG] Анна Смирнова: [стикер 😂]"
+
+    asyncio.run(scenario())
+
+
+def test_album_photos_upload_in_parallel_and_keep_order(make_app):
+    async def scenario():
+        app = await bridged(make_app)
+        app.vk.upload_delay = 0.05
+        to_vk = ToVK(app)
+        to_vk.album_delay = 0.01
+        for i in range(6):
+            message = tg_msg(20 + i, photo=photo_sizes(f"p{i}"), media_group_id="big")
+            await tg_handlers.on_group_message(message, app, to_vk)
+        await app.outbox.join()
+
+        assert app.vk.max_parallel_uploads == UPLOAD_CONCURRENCY
+        assert [upload[1] for upload in app.vk.uploads] == [f"file:p{i}".encode() for i in range(6)]
+        assert app.vk.sent[-1]["attachments"] == [f"photo-77_{i}" for i in range(1, 7)]
 
     asyncio.run(scenario())
 

@@ -53,6 +53,9 @@ class FakeVK:
         self.next_cmid = 500
         self.random_ids: list[int | None] = []  # random_id каждой попытки отправки, включая неудачные
         self.fail_sends: list[Exception] = []  # ошибки, которые вернут следующие вызовы send()
+        self.upload_delay = 0.0  # имитация медленной загрузки фото
+        self.active_uploads = 0
+        self.max_parallel_uploads = 0
         self.chat_settings: dict | None = {"owner_id": 1, "admin_ids": [2], "title": "Беседа"}
 
     async def call(self, method: str, **params):
@@ -82,7 +85,12 @@ class FakeVK:
 
     async def upload_photo(self, peer_id, data, filename="photo.jpg"):
         self.uploads.append(("photo", data, filename))
-        return f"photo-77_{len(self.uploads)}"
+        number = len(self.uploads)
+        self.active_uploads += 1
+        self.max_parallel_uploads = max(self.max_parallel_uploads, self.active_uploads)
+        await asyncio.sleep(self.upload_delay)
+        self.active_uploads -= 1
+        return f"photo-77_{number}"
 
     async def upload_doc(self, peer_id, data, filename, doc_type="doc"):
         self.uploads.append((doc_type, data, filename))

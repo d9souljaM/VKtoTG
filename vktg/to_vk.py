@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
 from typing import Any
 
 from aiogram.types import Message
@@ -13,6 +15,9 @@ from .formatting import VK_TEXT_LIMIT, shorten, sign, split_text, tg_text_with_l
 from .vk_api import VKError
 
 log = logging.getLogger(__name__)
+
+UPLOAD_CONCURRENCY = 4  # сколько файлов альбома загружать в VK одновременно (лимит VK — 20 запросов/с)
+SLOW_UPLOAD = 3.0  # загрузки дольше этого (в секундах) попадают в лог с разбивкой по этапам
 
 
 def tg_sender_name(message: Message) -> str:
@@ -169,13 +174,24 @@ class ToVK:
 
     async def _forward_album(self, bridge: Bridge, messages: list[Message], nonce: int) -> None:
         messages = sorted(messages, key=lambda m: m.message_id)[:10]
-        attachments, notes = [], []
-        for message in messages:
-            attachment, note = await self._upload(bridge.vk_peer_id, message)
-            if attachment:
-                attachments.append(attachment)
-            if note:
-                notes.append(note)
+        # Части альбома загружаются параллельно: по очереди 10 фото шли бы 15–20 секунд.
+        semaphore = asyncio.Semaphore(UPLOAD_CONCURRENCY)
+
+        async def upload(message: Message) -> tuple[str | None, str | None]:
+            async with semaphore:
+                return await self._upload(bridge.vk_peer_id, message)
+
+        started = time.monotonic()
+        results = await asyncio.gather(*(upload(m) for m in messages))  # порядок сохраняется
+        attachments = [attachment for attachment, _ in results if attachment]
+        notes = [note for _, note in results if note]
+        elapsed = time.monotonic() - started
+        log.log(
+            logging.INFO if elapsed > SLOW_UPLOAD else logging.DEBUG,
+            "Альбом из %d файлов загружен в VK за %.1f с",
+            len(messages),
+            elapsed,
+        )
         text_source = next((m for m in messages if m.caption), messages[0])
         body, reply_cmid = await self._compose(bridge, messages[0], notes, text_source)
         cmid = await self._deliver(bridge.vk_peer_id, body, attachments, reply_cmid, nonce)
@@ -252,14 +268,27 @@ class ToVK:
         if (file.file_size or 0) > self._limit:
             return None, f"[{label}: больше {self.app.cfg.tg_download_limit_mb} МБ, не передан]"
         try:
+            started = time.monotonic()
             buffer = await self.app.bot.download(file, timeout=120)
             data = buffer.read()
+            downloaded = time.monotonic()
             if upload_type == "photo":
-                return await self.app.vk.upload_photo(peer_id, data, filename), None
-            return await self.app.vk.upload_doc(peer_id, data, filename, upload_type), None
+                attachment = await self.app.vk.upload_photo(peer_id, data, filename)
+            else:
+                attachment = await self.app.vk.upload_doc(peer_id, data, filename, upload_type)
         except Exception as exc:
             log.warning("Не удалось передать %s в VK: %s", label, exc)
             return None, f"[{label}: не удалось передать]"
+        total = time.monotonic() - started
+        log.log(
+            logging.INFO if total > SLOW_UPLOAD else logging.DEBUG,
+            "%s %d КБ: скачано из Telegram за %.1f с, загружено в VK за %.1f с",
+            label.capitalize(),
+            len(data) // 1024,
+            downloaded - started,
+            total - (downloaded - started),
+        )
+        return attachment, None
 
     async def _deliver(
         self, peer_id: int, body: str, attachments: list[str], reply_cmid: int | None, nonce: int
