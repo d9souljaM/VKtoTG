@@ -2,7 +2,7 @@
 __pycache__/
 .pytest_cache/
 .env
-vktg-deploy.tar.gz
+*.tar.gz
 *.db
 *.db-wal
 *.db-shm

@@ -18,7 +18,7 @@ API_URL = "https://api.vk.com/method/"
 CHAT_PEER_OFFSET = 2_000_000_000  # peer_id бесед начинаются с этого числа
 
 # 1 — неизвестная ошибка, 6 — слишком много запросов, 9 — флуд-контроль, 10 — внутренняя ошибка VK.
-_RETRYABLE = {1, 6, 9, 10}
+RETRYABLE_CODES = {1, 6, 9, 10}
 _ATTEMPTS = 5
 
 
@@ -75,7 +75,7 @@ class VKApi:
             if error is None:
                 return payload["response"]
             code = error.get("error_code", 0)
-            if code in _RETRYABLE and attempt < _ATTEMPTS:
+            if code in RETRYABLE_CODES and attempt < _ATTEMPTS:
                 await asyncio.sleep(delay)
                 delay *= 2
                 continue
@@ -91,14 +91,19 @@ class VKApi:
     # --- сообщения ---
 
     async def send(
-        self, peer_id: int, text: str = "", attachments: Iterable[str] = (), reply_cmid: int | None = None
+        self,
+        peer_id: int,
+        text: str = "",
+        attachments: Iterable[str] = (),
+        reply_cmid: int | None = None,
+        random_id: int | None = None,
     ) -> int:
         """Отправляет сообщение и возвращает его conversation_message_id."""
         params: dict[str, Any] = {
             # peer_ids вместо peer_id: только так VK возвращает conversation_message_id.
             "peer_ids": peer_id,
-            # Одинаковый random_id при повторе запроса защищает от дублей.
-            "random_id": secrets.randbelow(2**31 - 1) + 1,
+            # VK не отправляет повторно сообщение с тем же random_id — это защищает от дублей при повторах.
+            "random_id": random_id or secrets.randbelow(2**31 - 1) + 1,
             "message": text or None,
             "attachment": ",".join(attachments) or None,
             "disable_mentions": 1,

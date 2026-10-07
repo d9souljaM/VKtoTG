@@ -15,7 +15,7 @@ from aiogram.exceptions import TelegramNetworkError, TelegramRetryAfter
 
 from .config import Config
 from .db import Storage
-from .queues import KeyedQueues
+from .queues import Outbox
 from .vk_api import VKApi, VKError
 
 log = logging.getLogger(__name__)
@@ -33,7 +33,7 @@ class App:
     group_name: str
     group_screen_name: str
     tg_username: str
-    queues: KeyedQueues
+    outbox: Outbox
     names: VKNames
     fetch: Fetch
 

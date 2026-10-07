@@ -1,11 +1,14 @@
 import asyncio
 from datetime import datetime
 
+import aiohttp
 from aiogram.types import Chat, Message, PhotoSize, Sticker, User
 
 from vktg import tg_handlers
+from vktg.queues import Outbox
 from vktg.to_tg import ToTG
 from vktg.to_vk import ToVK
+from vktg.vk_api import VKError
 from vktg.vk_handlers import VKHandlers
 
 VK_PEER = 2_000_000_001
@@ -52,7 +55,7 @@ def test_vk_text_goes_to_telegram(make_app):
         app = await bridged(make_app)
         handlers = VKHandlers(app, ToTG(app))
         await handlers.handle(vk_update(text="Привет, [id9|Оля] <3", conversation_message_id=10))
-        await app.queues.join()
+        await app.outbox.join()
 
         name, kwargs = app.bot.calls[-1]
         assert name == "send_message"
@@ -70,7 +73,7 @@ def test_vk_photos_become_album_with_caption(make_app):
         handlers = VKHandlers(app, ToTG(app))
         attachments = [vk_photo("https://vk/1.jpg"), vk_photo("https://vk/2.jpg")]
         await handlers.handle(vk_update(text="отпуск", attachments=attachments, conversation_message_id=11))
-        await app.queues.join()
+        await app.outbox.join()
 
         name, kwargs = app.bot.calls[-1]
         assert name == "send_media_group" and len(kwargs["media"]) == 2
@@ -91,7 +94,7 @@ def test_vk_reply_and_edit_are_mirrored(make_app):
         reply_message = {"conversation_message_id": 10, "from_id": 5, "text": "раз"}
         await handlers.handle(vk_update(text="два", conversation_message_id=11, reply_message=reply_message))
         await handlers.handle(vk_update("message_edit", text="раз (испр.)", conversation_message_id=10))
-        await app.queues.join()
+        await app.outbox.join()
 
         (_, first), (_, second), (edit_name, edit) = app.bot.calls
         assert first["reply_parameters"] is None
@@ -111,7 +114,7 @@ def test_vk_unavailable_media_becomes_links(make_app):
             vk_photo("https://vk/broken.jpg"),
         ]
         await handlers.handle(vk_update(text="", attachments=attachments, conversation_message_id=12))
-        await app.queues.join()
+        await app.outbox.join()
 
         name, kwargs = app.bot.calls[-1]
         assert name == "send_message"
@@ -129,7 +132,7 @@ def test_vk_ignores_own_messages_and_respects_direction(make_app):
         bridge = await app.db.bridge_by_vk(VK_PEER)
         await app.db.set_direction(bridge.id, "tg2vk")
         await handlers.handle(vk_update(text="не пересылать", conversation_message_id=14))
-        await app.queues.join()
+        await app.outbox.join()
         assert app.bot.calls == []
 
     asyncio.run(scenario())
@@ -142,7 +145,7 @@ def test_tg_text_goes_to_vk(make_app):
     async def scenario():
         app = await bridged(make_app)
         await tg_handlers.on_group_message(tg_msg(1, text="Привет"), app, ToVK(app))
-        await app.queues.join()
+        await app.outbox.join()
 
         sent = app.vk.sent[-1]
         assert (sent["peer_id"], sent["text"], sent["attachments"]) == (VK_PEER, "[TG] Анна Смирнова: Привет", [])
@@ -160,7 +163,7 @@ def test_tg_reply_to_mirrored_message_becomes_vk_reply(make_app):
         await tg_handlers.on_group_message(tg_msg(2, text="ответ", reply_to_message=original), app, ToVK(app))
         unknown = tg_msg(60, text="старое сообщение до моста")
         await tg_handlers.on_group_message(tg_msg(3, text="ещё", reply_to_message=unknown), app, ToVK(app))
-        await app.queues.join()
+        await app.outbox.join()
 
         assert app.vk.sent[0]["reply_cmid"] == 33
         assert app.vk.sent[1]["reply_cmid"] is None
@@ -174,7 +177,7 @@ def test_tg_photo_is_uploaded_to_vk(make_app):
         app = await bridged(make_app)
         message = tg_msg(4, photo=photo_sizes("big"), caption="фото")
         await tg_handlers.on_group_message(message, app, ToVK(app))
-        await app.queues.join()
+        await app.outbox.join()
 
         assert app.vk.uploads == [("photo", b"file:big", "photo.jpg")]
         assert app.vk.sent[-1]["attachments"] == ["photo-77_1"]
@@ -193,7 +196,7 @@ def test_tg_album_becomes_one_vk_message(make_app):
         after = tg_msg(7, text="после альбома")
         for message in (first, second, after):
             await tg_handlers.on_group_message(message, app, to_vk)
-        await app.queues.join()
+        await app.outbox.join()
 
         album, text = app.vk.sent
         assert album["attachments"] == ["photo-77_1", "photo-77_2"]
@@ -211,7 +214,7 @@ def test_tg_edit_updates_vk_message(make_app):
         to_vk = ToVK(app)
         await tg_handlers.on_group_message(tg_msg(8, photo=photo_sizes("p"), caption="было"), app, to_vk)
         await tg_handlers.on_group_edit(tg_msg(8, photo=photo_sizes("p"), caption="стало"), app, to_vk)
-        await app.queues.join()
+        await app.outbox.join()
 
         cmid = app.vk.sent[-1]["cmid"]
         assert app.vk.edits == [(VK_PEER, cmid, "[TG] Анна Смирнова: стало", "photo-77_1")]
@@ -227,7 +230,92 @@ def test_tg_sticker_becomes_text(make_app):
             is_animated=False, is_video=False, emoji="😂",
         )
         await tg_handlers.on_group_message(tg_msg(9, sticker=sticker), app, ToVK(app))
-        await app.queues.join()
+        await app.outbox.join()
         assert app.vk.sent[-1]["text"] == "[TG] Анна Смирнова: [стикер 😂]"
+
+    asyncio.run(scenario())
+
+
+# --- очередь доставки ---
+
+
+def test_transient_error_is_retried_without_duplicates(make_app):
+    async def scenario():
+        app = await bridged(make_app)
+        app.vk.fail_sends = [aiohttp.ClientConnectionError("сеть пропала")]
+        await tg_handlers.on_group_message(tg_msg(1, text="раз"), app, ToVK(app))
+        await app.outbox.join()
+
+        assert [s["text"] for s in app.vk.sent] == ["[TG] Анна Смирнова: раз"]
+        first, second = app.vk.random_ids
+        assert first == second  # повтор с тем же random_id: VK не создаст дубль
+        assert await app.db.outbox_count() == 0
+
+    asyncio.run(scenario())
+
+
+def test_permanent_error_does_not_block_queue(make_app):
+    async def scenario():
+        app = await bridged(make_app)
+        app.vk.fail_sends = [VKError(917, "нет доступа к беседе", "messages.send")]
+        to_vk = ToVK(app)
+        await tg_handlers.on_group_message(tg_msg(1, text="раз"), app, to_vk)
+        await tg_handlers.on_group_message(tg_msg(2, text="два"), app, to_vk)
+        await app.outbox.join()
+
+        assert [s["text"] for s in app.vk.sent] == ["[TG] Анна Смирнова: два"]
+        assert len(app.vk.random_ids) == 2  # первое сообщение не повторялось
+        assert await app.db.outbox_count() == 0
+
+    asyncio.run(scenario())
+
+
+class CrashedOutbox(Outbox):
+    """Очередь бота, который упал сразу после приёма сообщений: задачи пишутся в базу, но не доставляются."""
+
+    def _kick(self, target):
+        pass
+
+
+def test_queue_survives_restart(make_app):
+    async def scenario():
+        app = await bridged(make_app)
+        app.outbox = CrashedOutbox(app.db)
+        to_vk = ToVK(app)
+        to_vk.album_delay = 0.05
+        question = tg_msg(50, text="вопрос")  # ответ проверяет, что вложенные объекты переживают JSON
+        await tg_handlers.on_group_message(
+            tg_msg(1, photo=photo_sizes("a"), media_group_id="g", reply_to_message=question), app, to_vk
+        )
+        await tg_handlers.on_group_message(
+            tg_msg(2, photo=photo_sizes("b"), media_group_id="g", caption="альбом", reply_to_message=question),
+            app, to_vk,
+        )
+        await tg_handlers.on_group_message(tg_msg(3, text="после"), app, to_vk)
+        assert app.vk.sent == []
+
+        # Новый запуск: та же база, новая очередь и новые обработчики без памяти об альбоме.
+        app.outbox = Outbox(app.db, retry_base=0.01)
+        ToVK(app)
+        assert await app.outbox.start() == 2
+        await app.outbox.join()
+
+        album, text = app.vk.sent
+        assert album["attachments"] == ["photo-77_1", "photo-77_2"]
+        assert album["text"] == "[TG] Анна Смирнова: ↩ В ответ на Анна Смирнова: «вопрос»\nальбом"
+        assert text["text"] == "[TG] Анна Смирнова: после"
+
+    asyncio.run(scenario())
+
+
+def test_vk_message_waits_in_queue_while_bridge_removed(make_app):
+    async def scenario():
+        app = await bridged(make_app)
+        handlers = VKHandlers(app, ToTG(app))
+        bridge = await app.db.bridge_by_vk(VK_PEER)
+        await handlers.handle(vk_update(text="успею?", conversation_message_id=20))
+        await app.db.delete_bridge(bridge.id)  # мост отключили, пока сообщение ждало в очереди
+        await app.outbox.join()
+        assert app.bot.calls == []
 
     asyncio.run(scenario())

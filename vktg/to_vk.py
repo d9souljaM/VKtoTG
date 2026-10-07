@@ -2,16 +2,13 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
-from dataclasses import dataclass, field
-from functools import partial
 from typing import Any
 
 from aiogram.types import Message
 
 from .app import App
-from .db import Bridge
+from .db import Bridge, OutboxJob
 from .formatting import VK_TEXT_LIMIT, shorten, sign, split_text, tg_text_with_links, vk_header
 from .vk_api import VKError
 
@@ -93,11 +90,9 @@ def media_spec(message: Message) -> tuple[Any, str, str, str] | None:
     return None
 
 
-@dataclass
-class _Album:
-    messages: list[Message] = field(default_factory=list)
-    ready: asyncio.Event = field(default_factory=asyncio.Event)
-    timer: asyncio.TimerHandle | None = None
+def dump_message(message: Message) -> dict[str, Any]:
+    """Сообщение Telegram в JSON для очереди доставки."""
+    return message.model_dump(mode="json", exclude_none=True)
 
 
 class ToVK:
@@ -105,48 +100,75 @@ class ToVK:
 
     def __init__(self, app: App) -> None:
         self.app = app
-        self._albums: dict[str, _Album] = {}
+        # media_group_id → (id задачи в очереди, части альбома): Telegram присылает их по одной.
+        self._albums: dict[str, tuple[int, list[Message]]] = {}
+        app.outbox.register("tg_message", self._run_message)
+        app.outbox.register("tg_album", self._run_album)
+        app.outbox.register("tg_edit", self._run_edit)
 
     @property
     def _limit(self) -> int:
         return self.app.cfg.tg_download_limit_mb * 1024 * 1024
 
-    def submit(self, bridge: Bridge, message: Message) -> None:
-        key = ("vk", bridge.vk_peer_id)
+    async def submit(self, bridge: Bridge, message: Message) -> None:
+        target = f"vk:{bridge.vk_peer_id}"
         group_id = message.media_group_id
         if group_id is None:
-            self.app.queues.put(key, partial(self._forward, bridge, message))
+            await self.app.outbox.put(target, "tg_message", dump_message(message))
             return
         album = self._albums.get(group_id)
         if album is None:
-            album = self._albums[group_id] = _Album()
-            # Задача встаёт в очередь сразу, чтобы следующие сообщения не обогнали альбом.
-            self.app.queues.put(key, partial(self._forward_album, bridge, album))
-        album.messages.append(message)
-        if album.timer:
-            album.timer.cancel()
-        album.timer = asyncio.get_running_loop().call_later(self.album_delay, self._close_album, group_id)
+            # Задача встаёт в очередь с первой частью альбома, чтобы следующие сообщения
+            # не обогнали его; остальные части дописываются в неё по мере прихода.
+            job_id = await self.app.outbox.put(target, "tg_album", [dump_message(message)], delay=self.album_delay)
+            self._albums[group_id] = (job_id, [message])
+            return
+        job_id, messages = album
+        messages.append(message)
+        await self.app.outbox.update(job_id, [dump_message(m) for m in messages], delay=self.album_delay)
 
-    def submit_edit(self, bridge: Bridge, message: Message) -> None:
-        self.app.queues.put(("vk", bridge.vk_peer_id), partial(self._edit, bridge, message))
+    async def submit_edit(self, bridge: Bridge, message: Message) -> None:
+        await self.app.outbox.put(f"vk:{bridge.vk_peer_id}", "tg_edit", dump_message(message))
 
-    def _close_album(self, group_id: str) -> None:
-        album = self._albums.pop(group_id, None)
-        if album:
-            album.ready.set()
+    async def _bridge(self, job: OutboxJob, message: Message) -> Bridge | None:
+        """Связка на момент отправки: пока сообщение ждало в очереди, её могли отключить."""
+        bridge = await self.app.db.bridge_by_tg(message.chat.id)
+        if bridge is None or not bridge.to_vk or job.target != f"vk:{bridge.vk_peer_id}":
+            return None
+        return bridge
 
-    async def _forward(self, bridge: Bridge, message: Message) -> None:
+    async def _run_message(self, job: OutboxJob) -> None:
+        message = Message.model_validate(job.payload)
+        bridge = await self._bridge(job, message)
+        if bridge:
+            await self._forward(bridge, message, job.nonce)
+
+    async def _run_album(self, job: OutboxJob) -> None:
+        messages = [Message.model_validate(m) for m in job.payload]
+        album = self._albums.pop(messages[0].media_group_id or "", None)
+        if album and album[0] == job.id:
+            messages = album[1]  # в памяти могут быть части, которые ещё не записаны в базу
+        bridge = await self._bridge(job, messages[0])
+        if bridge:
+            await self._forward_album(bridge, messages, job.nonce)
+
+    async def _run_edit(self, job: OutboxJob) -> None:
+        message = Message.model_validate(job.payload)
+        bridge = await self._bridge(job, message)
+        if bridge:
+            await self._edit(bridge, message)
+
+    async def _forward(self, bridge: Bridge, message: Message, nonce: int) -> None:
         attachment, note = await self._upload(bridge.vk_peer_id, message)
         body, reply_cmid = await self._compose(bridge, message, [note] if note else [])
         attachments = [attachment] if attachment else []
-        cmid = await self._deliver(bridge.vk_peer_id, body, attachments, reply_cmid)
+        cmid = await self._deliver(bridge.vk_peer_id, body, attachments, reply_cmid, nonce)
         await self.app.db.save_link(
             message.chat.id, message.message_id, bridge.vk_peer_id, cmid, "source", ",".join(attachments)
         )
 
-    async def _forward_album(self, bridge: Bridge, album: _Album) -> None:
-        await album.ready.wait()
-        messages = sorted(album.messages, key=lambda m: m.message_id)[:10]
+    async def _forward_album(self, bridge: Bridge, messages: list[Message], nonce: int) -> None:
+        messages = sorted(messages, key=lambda m: m.message_id)[:10]
         attachments, notes = [], []
         for message in messages:
             attachment, note = await self._upload(bridge.vk_peer_id, message)
@@ -156,7 +178,7 @@ class ToVK:
                 notes.append(note)
         text_source = next((m for m in messages if m.caption), messages[0])
         body, reply_cmid = await self._compose(bridge, messages[0], notes, text_source)
-        cmid = await self._deliver(bridge.vk_peer_id, body, attachments, reply_cmid)
+        cmid = await self._deliver(bridge.vk_peer_id, body, attachments, reply_cmid, nonce)
         joined = ",".join(attachments)
         for message in messages:
             await self.app.db.save_link(message.chat.id, message.message_id, bridge.vk_peer_id, cmid, "source", joined)
@@ -239,9 +261,12 @@ class ToVK:
             log.warning("Не удалось передать %s в VK: %s", label, exc)
             return None, f"[{label}: не удалось передать]"
 
-    async def _deliver(self, peer_id: int, body: str, attachments: list[str], reply_cmid: int | None) -> int:
+    async def _deliver(
+        self, peer_id: int, body: str, attachments: list[str], reply_cmid: int | None, nonce: int
+    ) -> int:
+        # random_id из задачи очереди: при повторе после сбоя VK не создаст дубль уже отправленной части.
         chunks = split_text(body, VK_TEXT_LIMIT)
-        cmid = await self.app.vk.send(peer_id, chunks[0], attachments, reply_cmid)
-        for chunk in chunks[1:]:
-            await self.app.vk.send(peer_id, chunk)
+        cmid = await self.app.vk.send(peer_id, chunks[0], attachments, reply_cmid, random_id=nonce)
+        for i, chunk in enumerate(chunks[1:], start=1):
+            await self.app.vk.send(peer_id, chunk, random_id=nonce + i)
         return cmid

@@ -5,14 +5,13 @@ from __future__ import annotations
 import html
 import logging
 from dataclasses import dataclass
-from functools import partial
 from typing import Any
 
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import BufferedInputFile, InputMediaPhoto, InputMediaVideo, ReplyParameters
 
 from .app import App, tg_retry
-from .db import Bridge
+from .db import Bridge, OutboxJob
 from .formatting import (
     TG_CAPTION_LIMIT,
     TG_TEXT_LIMIT,
@@ -76,16 +75,35 @@ def video_file_url(video: dict[str, Any]) -> str | None:
 class ToTG:
     def __init__(self, app: App) -> None:
         self.app = app
+        app.outbox.register("vk_message", self._run_message)
+        app.outbox.register("vk_edit", self._run_edit)
 
     @property
     def _limit(self) -> int:
         return self.app.cfg.tg_upload_limit_mb * 1024 * 1024
 
-    def submit(self, bridge: Bridge, msg: dict[str, Any]) -> None:
-        self.app.queues.put(("tg", bridge.tg_chat_id), partial(self.deliver, bridge, msg))
+    async def submit(self, bridge: Bridge, msg: dict[str, Any]) -> None:
+        await self.app.outbox.put(f"tg:{bridge.tg_chat_id}", "vk_message", msg)
 
-    def submit_edit(self, bridge: Bridge, msg: dict[str, Any]) -> None:
-        self.app.queues.put(("tg", bridge.tg_chat_id), partial(self.edit, bridge, msg))
+    async def submit_edit(self, bridge: Bridge, msg: dict[str, Any]) -> None:
+        await self.app.outbox.put(f"tg:{bridge.tg_chat_id}", "vk_edit", msg)
+
+    async def _bridge(self, job: OutboxJob, msg: dict[str, Any]) -> Bridge | None:
+        """Связка на момент отправки: пока сообщение ждало в очереди, её могли отключить."""
+        bridge = await self.app.db.bridge_by_vk(msg.get("peer_id", 0))
+        if bridge is None or not bridge.to_tg or job.target != f"tg:{bridge.tg_chat_id}":
+            return None
+        return bridge
+
+    async def _run_message(self, job: OutboxJob) -> None:
+        bridge = await self._bridge(job, job.payload)
+        if bridge:
+            await self.deliver(bridge, job.payload)
+
+    async def _run_edit(self, job: OutboxJob) -> None:
+        bridge = await self._bridge(job, job.payload)
+        if bridge:
+            await self.edit(bridge, job.payload)
 
     async def deliver(self, bridge: Bridge, msg: dict[str, Any]) -> None:
         media, notes = await self._attachments(msg, download=True)

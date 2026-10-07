@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import json
+import secrets
 import sqlite3
 import time
 from dataclasses import dataclass
+from typing import Any
 
 import aiosqlite
 
@@ -41,6 +44,21 @@ CREATE TABLE IF NOT EXISTS messages (
 
 CREATE INDEX IF NOT EXISTS messages_by_vk ON messages (vk_peer_id, vk_cmid);
 CREATE INDEX IF NOT EXISTS messages_by_age ON messages (created_at);
+
+-- Очередь доставки. target — чат-получатель ("tg:<chat_id>" или "vk:<peer_id>"),
+-- задачи одного target выполняются строго по порядку id. Строка удаляется после доставки.
+CREATE TABLE IF NOT EXISTS outbox (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    target      TEXT    NOT NULL,
+    kind        TEXT    NOT NULL,
+    payload     TEXT    NOT NULL,
+    nonce       INTEGER NOT NULL,
+    attempts    INTEGER NOT NULL DEFAULT 0,
+    not_before  REAL    NOT NULL,
+    created_at  INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS outbox_by_target ON outbox (target, id);
 """
 
 DIRECTIONS = ("both", "tg2vk", "vk2tg")
@@ -75,6 +93,18 @@ class MessageLink:
     vk_cmid: int
     role: str
     vk_attachments: str
+
+
+@dataclass(frozen=True)
+class OutboxJob:
+    id: int
+    target: str
+    kind: str
+    payload: Any
+    nonce: int  # random_id для VK: повторная отправка той же задачи не создаёт дубль
+    attempts: int
+    not_before: float
+    created_at: int
 
 
 class AlreadyBridged(Exception):
@@ -211,4 +241,65 @@ class Storage:
 
     async def purge_links(self, max_age: int) -> None:
         await self._db.execute("DELETE FROM messages WHERE created_at < ?", (_now() - max_age,))
+        await self._db.commit()
+
+    # --- очередь доставки ---
+
+    async def outbox_add(self, target: str, kind: str, payload: Any, not_before: float) -> int:
+        cursor = await self._db.execute(
+            "INSERT INTO outbox (target, kind, payload, nonce, not_before, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                target,
+                kind,
+                json.dumps(payload, ensure_ascii=False),
+                secrets.randbelow(2**31 - 1000) + 1,  # запас: длинный текст уходит частями nonce, nonce+1, …
+                not_before,
+                _now(),
+            ),
+        )
+        await self._db.commit()
+        return cursor.lastrowid
+
+    async def outbox_update(self, job_id: int, payload: Any, not_before: float) -> None:
+        await self._db.execute(
+            "UPDATE outbox SET payload = ?, not_before = ? WHERE id = ?",
+            (json.dumps(payload, ensure_ascii=False), not_before, job_id),
+        )
+        await self._db.commit()
+
+    async def outbox_head(self, target: str) -> OutboxJob | None:
+        """Первая (самая старая) задача для чата-получателя."""
+        async with self._db.execute(
+            "SELECT * FROM outbox WHERE target = ? ORDER BY id LIMIT 1", (target,)
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            return None
+        return OutboxJob(
+            row["id"],
+            row["target"],
+            row["kind"],
+            json.loads(row["payload"]),
+            row["nonce"],
+            row["attempts"],
+            row["not_before"],
+            row["created_at"],
+        )
+
+    async def outbox_targets(self) -> list[str]:
+        async with self._db.execute("SELECT DISTINCT target FROM outbox") as cursor:
+            return [row["target"] for row in await cursor.fetchall()]
+
+    async def outbox_count(self) -> int:
+        async with self._db.execute("SELECT COUNT(*) AS n FROM outbox") as cursor:
+            return (await cursor.fetchone())["n"]
+
+    async def outbox_retry(self, job_id: int, not_before: float) -> None:
+        await self._db.execute(
+            "UPDATE outbox SET attempts = attempts + 1, not_before = ? WHERE id = ?", (not_before, job_id)
+        )
+        await self._db.commit()
+
+    async def outbox_done(self, job_id: int) -> None:
+        await self._db.execute("DELETE FROM outbox WHERE id = ?", (job_id,))
         await self._db.commit()

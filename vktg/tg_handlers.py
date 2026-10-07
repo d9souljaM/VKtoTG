@@ -55,13 +55,13 @@ async def on_group_message(message: Message, app: App, to_vk: ToVK) -> None:
         return
     bridge = await app.db.bridge_by_tg(message.chat.id)
     if bridge and bridge.to_vk:
-        to_vk.submit(bridge, message)
+        await to_vk.submit(bridge, message)
 
 
 async def on_group_edit(message: Message, app: App, to_vk: ToVK) -> None:
     bridge = await app.db.bridge_by_tg(message.chat.id)
     if bridge and bridge.to_vk:
-        to_vk.submit_edit(bridge, message)
+        await to_vk.submit_edit(bridge, message)
 
 
 async def on_added_to_group(event: ChatMemberUpdated, app: App) -> None:

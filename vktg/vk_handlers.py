@@ -79,7 +79,7 @@ class VKHandlers:
 
         bridge = await self.app.db.bridge_by_vk(peer_id)
         if bridge and bridge.to_tg:
-            self.to_tg.submit(bridge, msg)
+            await self.to_tg.submit(bridge, msg)
 
     async def on_edit(self, msg: dict[str, Any]) -> None:
         peer_id = msg.get("peer_id", 0)
@@ -87,7 +87,7 @@ class VKHandlers:
             return
         bridge = await self.app.db.bridge_by_vk(peer_id)
         if bridge and bridge.to_tg:
-            self.to_tg.submit_edit(bridge, msg)
+            await self.to_tg.submit_edit(bridge, msg)
 
     async def on_command(self, peer_id: int, from_id: int, name: str, args: str) -> None:
         if name in ("help", "start"):

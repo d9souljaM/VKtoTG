@@ -17,7 +17,7 @@ from .app import App, VKNames, fetch_url
 from .config import Config, ConfigError, load_config
 from .db import Storage
 from .linking import KEY_TTL
-from .queues import KeyedQueues
+from .queues import Outbox
 from .tg_handlers import build_router
 from .to_tg import ToTG
 from .to_vk import ToVK
@@ -69,7 +69,7 @@ async def run(cfg: Config) -> None:
     db = await Storage.open(cfg.db_path)
     http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120))
     bot = Bot(cfg.tg_token, session=AiohttpSession(proxy=cfg.tg_proxy) if cfg.tg_proxy else None)
-    queues = KeyedQueues()
+    outbox = Outbox(db)
     background: list[asyncio.Task[None]] = []
     try:
         vk = VKApi(cfg.vk_token, http, cfg.vk_api_version)
@@ -88,7 +88,7 @@ async def run(cfg: Config) -> None:
             group_name=group.get("name", ""),
             group_screen_name=group.get("screen_name") or f"club{group_id}",
             tg_username=me.username or "",
-            queues=queues,
+            outbox=outbox,
             names=VKNames(vk),
             fetch=partial(fetch_url, http),
         )
@@ -99,7 +99,12 @@ async def run(cfg: Config) -> None:
         except Exception as exc:
             log.warning("Не удалось задать меню команд Telegram: %s", exc)
 
-        vk_task = asyncio.create_task(VKHandlers(app, ToTG(app)).run(), name="vk-longpoll")
+        to_tg, to_vk = ToTG(app), ToVK(app)  # регистрируют обработчики очереди — до outbox.start()
+        pending = await outbox.start()
+        if pending:
+            log.info("В очереди %d сообщений с прошлого запуска — доставляю", pending)
+
+        vk_task = asyncio.create_task(VKHandlers(app, to_tg).run(), name="vk-longpoll")
         background += [vk_task, asyncio.create_task(cleanup_loop(app), name="cleanup")]
 
         def on_vk_stopped(task: asyncio.Task[None]) -> None:
@@ -115,7 +120,7 @@ async def run(cfg: Config) -> None:
         await dp.start_polling(
             bot,
             app=app,
-            to_vk=ToVK(app),
+            to_vk=to_vk,
             handle_as_tasks=False,
             allowed_updates=dp.resolve_used_update_types(),
         )
@@ -125,7 +130,7 @@ async def run(cfg: Config) -> None:
         for task in background:
             task.cancel()
         await asyncio.gather(*background, return_exceptions=True)
-        await queues.close()
+        await outbox.close()  # недоставленное остаётся в базе до следующего запуска
         await http.close()
         await bot.session.close()
         await db.close()
