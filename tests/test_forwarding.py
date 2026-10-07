@@ -124,6 +124,27 @@ def test_vk_unavailable_media_becomes_links(make_app):
     asyncio.run(scenario())
 
 
+def test_vk_photo_rejected_by_telegram_is_sent_as_link(make_app):
+    async def scenario():
+        app = await bridged(make_app)
+        app.bot.fail = {"send_media_group": RuntimeError("обрыв загрузки"), "send_photo": RuntimeError("обрыв")}
+        handlers = VKHandlers(app, ToTG(app))
+        album = [vk_photo("https://vk/1.jpg"), vk_photo("https://vk/2.jpg")]
+        await handlers.handle(vk_update(text="отпуск", attachments=album, conversation_message_id=30))
+        await handlers.handle(vk_update(text="и ещё", attachments=[vk_photo("https://vk/3.jpg")],
+                                        conversation_message_id=31))
+        await app.outbox.join()
+
+        (first_name, first), (second_name, second) = app.bot.calls
+        assert first_name == second_name == "send_message"
+        assert first["text"] == "<b>[VK] Иван #5</b>: отпуск\n🖼 Фото: https://vk/1.jpg\n🖼 Фото: https://vk/2.jpg"
+        assert second["text"] == "<b>[VK] Иван #5</b>: и ещё\n🖼 Фото: https://vk/3.jpg"
+        assert [link.role for link in await app.db.links_by_vk(VK_PEER, 30)] == ["text"]
+        assert await app.db.outbox_count() == 0  # без повторов
+
+    asyncio.run(scenario())
+
+
 def test_vk_ignores_own_messages_and_respects_direction(make_app):
     async def scenario():
         app = await bridged(make_app)

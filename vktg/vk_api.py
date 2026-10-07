@@ -7,6 +7,7 @@ import json
 import logging
 import mimetypes
 import secrets
+import time
 from collections.abc import AsyncIterator, Iterable
 from typing import Any
 
@@ -20,6 +21,10 @@ CHAT_PEER_OFFSET = 2_000_000_000  # peer_id бесед начинаются с �
 # 1 — неизвестная ошибка, 6 — слишком много запросов, 9 — флуд-контроль, 10 — внутренняя ошибка VK.
 RETRYABLE_CODES = {1, 6, 9, 10}
 _ATTEMPTS = 5
+# Обычный запрос к API не должен висеть минутами: зависшее соединение держит очередь чата.
+# Загрузка файлов и long poll используют свои таймауты.
+_API_TIMEOUT = aiohttp.ClientTimeout(total=30, sock_connect=10)
+SLOW_CALL = 2.0  # ответы API дольше этого (в секундах) попадают в лог
 
 
 class VKError(Exception):
@@ -60,22 +65,32 @@ class VKApi:
         data["v"] = self.version
         delay = 1.0
         for attempt in range(1, _ATTEMPTS + 1):
+            started = time.monotonic()
             try:
-                async with self._http.post(API_URL + method, data=data) as resp:
+                async with self._http.post(API_URL + method, data=data, timeout=_API_TIMEOUT) as resp:
                     payload = await resp.json(content_type=None)
             except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
                 if attempt == _ATTEMPTS:
                     raise
-                log.warning("VK %s: сетевая ошибка (%s), повтор через %.0f с", method, exc, delay)
+                log.warning(
+                    "VK %s: сетевая ошибка через %.1f с (%r), повтор через %.0f с",
+                    method, time.monotonic() - started, exc, delay,
+                )
                 await asyncio.sleep(delay)
                 delay *= 2
                 continue
+            elapsed = time.monotonic() - started
+            if elapsed > SLOW_CALL:
+                log.info("VK %s ответил за %.1f с", method, elapsed)
 
             error = payload.get("error")
             if error is None:
                 return payload["response"]
             code = error.get("error_code", 0)
             if code in RETRYABLE_CODES and attempt < _ATTEMPTS:
+                log.warning(
+                    "VK %s: ошибка %s (%s), повтор через %.0f с", method, code, error.get("error_msg", ""), delay
+                )
                 await asyncio.sleep(delay)
                 delay *= 2
                 continue

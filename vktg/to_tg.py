@@ -37,6 +37,7 @@ class Media:
     kind: str  # photo | video | animation | voice | document
     data: bytes
     filename: str
+    fallback: str  # строка со ссылкой на оригинал — если Telegram не примет файл
 
 
 def _chunks(items: list[Media], size: int) -> list[tuple[Media, ...]]:
@@ -161,11 +162,12 @@ class ToTG:
                 return
             if not download:
                 return
+            link = fallback or f"{label}: {url}"
             data = await self.app.fetch(url, self._limit)
             if data is None:
-                notes.append(fallback or f"{label}: {url}")
+                notes.append(link)
             else:
-                media.append(Media(kind, data, filename))
+                media.append(Media(kind, data, filename, link))
 
         for attachment in msg.get("attachments") or []:
             kind = attachment.get("type", "")
@@ -275,18 +277,35 @@ class ToTG:
 
         visual = [m for m in media if m.kind in _VISUAL]
         others = [m for m in media if m.kind not in _VISUAL]
-        for group in _chunks(visual, 10):
-            if len(group) == 1:
-                ids = [await self._send_file(chat_id, group[0], caption, reply)]
-            else:
-                ids = await self._send_album(chat_id, group, caption, reply)
-            sent.append((ids[0], "caption" if caption else "media"))
-            sent.extend((message_id, "media") for message_id in ids[1:])
-            reply, caption = None, None
-        for item in others:
-            sent.append((await self._send_file(chat_id, item, caption, reply), "caption" if caption else "media"))
+        # Фото и видео — альбомами до 10 штук, остальные файлы — по одному.
+        for group in [*_chunks(visual, 10), *((item,) for item in others)]:
+            try:
+                if len(group) == 1:
+                    ids = [await self._send_file(chat_id, group[0], caption, reply)]
+                else:
+                    ids = await self._send_album(chat_id, group, caption, reply)
+                roles = ["caption" if caption else "media"] + ["media"] * (len(ids) - 1)
+            except Exception as exc:
+                # Telegram не принял файл (размер, формат, обрыв загрузки). Вместо повтора всего
+                # сообщения — с риском дублей и задержкой очереди — сразу отправляем ссылки.
+                log.warning(
+                    "Telegram не принял %s (%r), отправляю ссылкой", ", ".join(m.kind for m in group), exc
+                )
+                ids = [await self._send_links(chat_id, group, caption, reply)]
+                roles = ["text" if caption else "extra"]
+            sent.extend(zip(ids, roles))
             reply, caption = None, None
         return sent
+
+    async def _send_links(
+        self, chat_id: int, group: tuple[Media, ...], caption: str | None, reply: ReplyParameters | None
+    ) -> int:
+        links = "\n".join(html.escape(item.fallback, quote=False) for item in group)
+        text = f"{caption}\n{links}" if caption else links
+        message = await tg_retry(
+            self.app.bot.send_message, chat_id=chat_id, text=text, parse_mode="HTML", reply_parameters=reply
+        )
+        return message.message_id
 
     async def _send_text(
         self, chat_id: int, html_body: str, plain_body: str, reply: ReplyParameters | None

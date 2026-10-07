@@ -25,6 +25,7 @@ Handler = Callable[[OutboxJob], Awaitable[None]]
 
 MAX_AGE = 24 * 3600  # сколько пытаться доставить сообщение при временных сбоях
 MAX_RETRY_DELAY = 600  # самая длинная пауза между попытками
+SLOW_DELIVERY = 3.0  # доставки дольше этого (в секундах) попадают в лог с разбивкой по этапам
 
 
 def is_transient(exc: BaseException) -> bool:
@@ -103,6 +104,7 @@ class Outbox:
 
     async def _run(self, job: OutboxJob) -> None:
         handler = self._handlers.get(job.kind)
+        started = time.time()
         try:
             if handler is None:
                 raise LookupError(f"нет обработчика для задачи {job.kind}")
@@ -119,6 +121,14 @@ class Outbox:
             log.error(
                 "Сообщение для %s не доставлено: %r", job.target, exc, exc_info=None if transient else exc
             )
+        else:
+            sending = time.time() - started
+            waited = max(0.0, started - job.not_before)  # стояло за другими сообщениями чата
+            if sending + waited > SLOW_DELIVERY:
+                log.info(
+                    "Доставка %s в %s: ждало в очереди %.1f с, отправка %.1f с",
+                    job.kind, job.target, waited, sending,
+                )
         await self._db.outbox_done(job.id)
 
     async def join(self) -> None:

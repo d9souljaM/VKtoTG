@@ -21,6 +21,7 @@ from vktg.queues import Outbox  # noqa: E402
 class FakeBot:
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict]] = []
+        self.fail: dict[str, Exception] = {}  # метод Bot API → ошибка, которую он вернёт
         self._next_id = 1000
 
     def _message(self) -> SimpleNamespace:
@@ -32,6 +33,8 @@ class FakeBot:
             raise AttributeError(name)
 
         async def method(**kwargs):
+            if name in self.fail:
+                raise self.fail[name]
             self.calls.append((name, kwargs))
             if name == "send_media_group":
                 return [self._message() for _ in kwargs["media"]]
