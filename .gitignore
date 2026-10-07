@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+.pytest_cache/
+.env
+vktg-deploy.tar.gz
+*.db
+*.db-wal
+*.db-shm
+logs/
+temp/

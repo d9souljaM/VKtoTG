@@ -1,0 +1,2 @@
+# Везде LF: deploy/install.sh с CRLF не запустится на Linux-сервере.
+* text=auto eol=lf
